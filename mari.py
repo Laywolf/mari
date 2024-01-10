@@ -3,7 +3,6 @@ import discord
 from discord.ext import commands
 import functools
 import typing
-import asyncio
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
@@ -15,64 +14,83 @@ import os
 
 load_dotenv()
 
-mari_prompt = os.environ.get('SECRET_PROMPT')
+mari_prompt = os.environ.get("SECRET_PROMPT")
+mari_channel_id = int(os.environ.get("MARI_CHANNEL_ID"))
 
-mari_channel_id = int(os.environ.get('MARI_CHANNEL_ID'))
+llama_model_path = os.environ.get("LLAMA_MODEL_PATH")
 
-llm = Llama(model_path="./model/ggml-model-q2_k.gguf", n_ctx=2048, verbose=False)
+sensei = os.environ.get("SENSEI")
+mari = os.environ.get("MARI")
 
-chat_memory = ConversationBufferMemory(human_prefix="선생님", ai_prefix="이오치 마리")
+llm = Llama(model_path=llama_model_path, n_ctx=4096, verbose=False)
+
+chat_memory = ConversationBufferMemory(human_prefix=sensei, ai_prefix=mari)
 
 CONDENSE_QUESTION_PROMPT = PromptTemplate.from_template(mari_prompt)
 
-def to_thread(func: typing.Callable) -> typing.Coroutine:
-    @functools.wraps(func)
-    async def wrapper(*args, **kwargs):
-        return await asyncio.to_thread(func, *args, **kwargs)
-    return wrapper
+now_inferencing = False
 
-@to_thread
+
 def chat(message):
-    print('대답 만드는 중...')
+    print("대답 만드는 중...")
     # extract chat history
     chats = chat_memory.load_memory_variables({})
-    chat_history_all = chats['history']
+    chat_history_all = chats["history"]
 
     # use last two chunks of chat history
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=4096,
+        chunk_size=1024,
         chunk_overlap=0,
-        separators=["\n\n", "\n", ".", " ", ""],
-        length_function = len,
+        separators=[sensei + ": "],
+        length_function=len,
     )
     texts = text_splitter.split_text(chat_history_all)
 
     pages = len(texts)
 
     if pages >= 2:
-        chat_history = f"{texts[pages-2]} {texts[pages-1]}"
+        chat_history = f"{texts[pages-2]}{texts[pages-1]}\n"
     elif pages == 1:
-        chat_history = texts[0]
+        chat_history = texts[0] + "\n"
     else:  # 0 page
         chat_history = ""
     # print(chat_history)
 
     query = CONDENSE_QUESTION_PROMPT.format(question=message, chat_history=chat_history)
-    # print(query)
+    print(query)
+
+    global now_inferencing
+    now_inferencing = True
 
     # make a question using chat history
-    if pages >= 1:
-        result = llm(query, max_tokens=1024, stop=["선생님:", "\n"], echo=False)
-    else:
-        result = llm(query, max_tokens=1024, stop=["선생님:", "\n"], echo=False)
-    
-    answer = str(result["choices"][0]["text"].split("\n")[-1]).replace("이오치 마리 : ", "")
+    result = llm(
+        query,
+        max_tokens=4096,
+        stop=[sensei + ": ", "\n", ":"],
+        echo=False,
+    )
 
-    chat_memory.save_context({"input": message}, {"output": answer})
+    print(result)
+
+    answer = str(result["choices"][0]["text"].split("\n")[-1]).replace(mari + ": ", "")
+
+    now_inferencing = False
+
+    chat_memory.save_context({"input": message + "\n"}, {"output": answer + "\n"})
 
     return answer
 
+
 app = commands.Bot(command_prefix="", intents=discord.Intents.all())
+
+
+async def run_blocking(blocking_func: typing.Callable, *args, **kwargs) -> typing.Any:
+    """Runs a blocking function in a non-blocking way"""
+    func = functools.partial(
+        blocking_func, *args, **kwargs
+    )  # `run_in_executor` doesn't support kwargs, `functools.partial` does
+    return await app.loop.run_in_executor(None, func)
+
 
 @app.event
 async def on_ready():
@@ -84,19 +102,22 @@ async def on_ready():
 
 @app.event
 async def on_message(message):
+    if now_inferencing:
+        return
     if message.author == app.user:
         return
     if message.channel.id != mari_channel_id:
         return
-    
+
     print(message.author, ": ", message.content)
 
     if message.content == "ping":
         await message.channel.send("pong {0.author.mention}".format(message))
     else:
-        answer = await chat(message=message.content)
+        answer = await run_blocking(chat, message=message.content)
         await message.channel.send(answer)
 
-TOKEN = os.environ.get('DISCORD_TOKEN')
+
+TOKEN = os.environ.get("DISCORD_TOKEN")
 
 app.run(TOKEN)
